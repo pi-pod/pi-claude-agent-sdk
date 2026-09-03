@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: Claude bridge identifies Pi as the host application** — the Claude Code preset now receives an explicit identity boundary explaining that Pi owns the user-facing commands, keyboard shortcuts, sessions, configuration, tools, and interface while Claude Code and the Agent SDK are only the provider runtime.
+
 ## 0.8.6 — 2026-09-01
 
 - **Fix: standalone extension completions no longer fail prompt capture** — tool-free one-shot `modelRegistry.complete()` calls marked no-cache, including pi-verbatim-compaction's planner, run in isolated Claude Code subprocesses with their supplied system prompt and never touch the resumable chat session. Pi compaction and branch summaries use the same route, replacing the competing event takeovers that caused duplicate summary calls when another compaction extension was installed.
