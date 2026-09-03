@@ -25,6 +25,7 @@ import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachm
 import { createToolServer } from "./mcp-server.js";
 import { CC_CHILD_ENV, resolveClaudeChildEnv, type AnthropicAuthRegistry } from "./child-env.js";
 import { resolveClaudeCodeExecutable } from "./claude-executable.js";
+import { withPiHostIdentity } from "./host-identity.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -1521,11 +1522,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
 	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
-	const systemPromptAppend = promptCapture
+	const projectedPrompt = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
 		})
 		: undefined;
+	const systemPromptAppend = withPiHostIdentity(projectedPrompt);
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
