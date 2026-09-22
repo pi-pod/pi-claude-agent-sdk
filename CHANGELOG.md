@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: pi 0.86 registered no tools and failed every first turn** — pi 0.86.0's `normalizeContext()` folds the system prompt and tool list into a leading `system`-role message and stops passing `context.systemPrompt` / `context.tools`. The bridge read both, so on pi 0.86+ it registered zero MCP tools (the model was told pi's tools existed, could not call them, and emitted tool calls as prose with invented results) and dropped pi's context files, skills and custom prompt. The same message also counted as a prior that `convertPiMessages` has no branch for, so a first turn rebuilt a session with zero records; `Session.save()` writes no file for an empty record set and the turn then `--resume`d an id that was not on disk (`No conversation found with session ID`). `shimPi086Context` undoes the fold at the provider entry point, reproducing pi's own `getCurrentTools` / `getCurrentSystemMessage` / `getSystemMessageText` so the reconstructed prompt matches what pi assembled, and no-ops on the pre-0.86 contract.
+
 ## 0.8.6 — 2026-09-01
 
 - **Fix: standalone extension completions no longer fail prompt capture** — tool-free one-shot `modelRegistry.complete()` calls marked no-cache, including pi-verbatim-compaction's planner, run in isolated Claude Code subprocesses with their supplied system prompt and never touch the resumable chat session. Pi compaction and branch summaries use the same route, replacing the competing event takeovers that caused duplicate summary calls when another compaction extension was installed.

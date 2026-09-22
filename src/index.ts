@@ -730,6 +730,7 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	shimPi086Context,
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -1422,10 +1423,75 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 	c.releasePendingToolCalls("Operation aborted");
 }
 
+// --- pi >= 0.86 provider-contract shim ---
+//
+// pi 0.86.0 introduced normalizeContext(), which folds the system prompt AND the
+// tool list into a leading `system`-role message and stops passing
+// `context.systemPrompt` / `context.tools` to the provider entirely:
+//
+//   function normalizeContext(context) {
+//     let initialMessage = createInitialSystemMessage(context.systemPrompt, context.tools);
+//     return { messages: initialMessage ? [initialMessage, ...context.messages] : context.messages };
+//   }
+//
+// This bridge is written against the 0.85 contract, so on 0.86+ it sees
+// `tools === undefined` (registers zero MCP tools — nothing the model can call)
+// and `systemPrompt === undefined` (pi's context files, skills and custom prompt
+// are silently dropped). Worse, the leading system message counts as a prior
+// message that convertPiMessages has no branch for, so a first turn rebuilds a
+// session containing zero records; Session.save() writes no file for an empty
+// record set, and the turn then --resume's a session id that is not on disk:
+// "No conversation found with session ID: ...".
+//
+// Undo the fold, reproducing pi's own accessors exactly (getCurrentTools /
+// getCurrentSystemMessage / getSystemMessageText in pi's chunk-RCZIEVGO.js), so
+// everything downstream sees the 0.85 shape it expects. Remove once the bridge
+// supports the 0.86 contract natively.
+function shimPi086Context(context: Context): Context {
+	const ctxAny = context as unknown as { systemPrompt?: string; tools?: Tool[]; messages: Array<Record<string, any>> };
+	// Already the 0.85 shape (or a pi that still populates these): nothing to undo.
+	if (ctxAny.systemPrompt !== undefined || ctxAny.tools !== undefined) return context;
+	const messages = ctxAny.messages;
+	if (!messages?.some((m) => m?.role === "system")) return context;
+
+	// getCurrentTools: toolsAdded/toolsRemoved replayed in message order.
+	const tools = new Map<string, Tool>();
+	// getCurrentSystemMessage: contents joined, sections merged (null deletes).
+	const contents: string[] = [];
+	const sections = new Map<string, string>();
+	for (const message of messages) {
+		if (message?.role !== "system") continue;
+		const text = typeof message.content === "string" ? message.content : messageContentToText(message.content ?? []);
+		if (text.length > 0) contents.push(text);
+		for (const [name, value] of Object.entries(message.sections ?? {})) {
+			if (value === null) sections.delete(name);
+			else sections.set(name, value as string);
+		}
+		for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+		for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool as Tool);
+	}
+	// getSystemMessageText: [merged content, ...section values], empties dropped.
+	const systemPrompt = [contents.join("\n\n"), ...sections.values()]
+		.filter((part) => part.length > 0)
+		.join("\n\n");
+
+	const toolList = [...tools.values()];
+	debug(`shimPi086Context: unfolded system message → systemPrompt=${systemPrompt.length} chars, tools=${toolList.length}, messages ${messages.length}→${messages.length - messages.filter((m) => m?.role === "system").length}`);
+	return {
+		...context,
+		// Left undefined when empty so isStandaloneRequest still recognises pi's
+		// no-cache summary/extension completions, which require tools === undefined.
+		...(toolList.length > 0 ? { tools: toolList } : {}),
+		...(systemPrompt.length > 0 ? { systemPrompt } : {}),
+		messages: messages.filter((m) => m?.role !== "system"),
+	} as unknown as Context;
+}
+
 /** Provider entry point. Pi calls this for normal agent turns, but also for
  * standalone no-cache completions made by compaction and extensions. Route the
  * latter before touching prompt captures or resumable-session state. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	context = shimPi086Context(context);
 	if (isStandaloneRequest(context, options)) {
 		debug(`provider: routing standalone cacheRetention=none request to isolated subprocess`);
 		return standaloneStreamFn(model, context, options);
