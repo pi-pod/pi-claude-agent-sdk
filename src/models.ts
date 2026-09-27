@@ -2,7 +2,7 @@
 // `resolveModel` returns the first partial match, so `opus` resolves to the first-listed opus entry.
 // Extracted from index.ts so tests can import without activating the extension.
 
-export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
+export const MODEL_IDS_IN_ORDER = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
 const TWO_HUNDRED_K_CONTEXT = 200_000;
 const ONE_M_CONTEXT = 1_000_000;
@@ -19,6 +19,16 @@ export const FALLBACK_MODELS: Record<string, {
 	maxTokens: number;
 	thinkingLevelMap?: Record<string, string | null>;
 }> = {
+	"claude-opus-5-5": {
+		id: "claude-opus-5-5",
+		name: "Claude Opus 5.5",
+		reasoning: true,
+		input: ["text", "image"],
+		contextWindow: ONE_M_CONTEXT,
+		maxTokens: 128_000,
+		// Matches pi-ai's claude-opus-5-5: adaptive thinking, no off/minimal.
+		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+	},
 	"claude-fable-5-1": {
 		id: "claude-fable-5-1",
 		name: "Claude Fable 5.1",
@@ -65,6 +75,10 @@ export type ClaudeCodeRuntimeModel = {
 // not, and [1m] entitlement differs by model. See diag/CONTEXT-SIZE.md.
 export function resolveClaudeCodeRuntimeModel(modelId: string, settings: LongContextSettings): ClaudeCodeRuntimeModel {
 	switch (modelId) {
+		case "claude-opus-5-5":
+			// 1M is the default and the maximum, billed at standard rates across the whole
+			// window (no Extra Usage). CC still takes the [1m] suffix to request that window.
+			return { cliModelId: "claude-opus-5-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-5":
 			return { cliModelId: "claude-opus-5[1m]", contextWindow: ONE_M_CONTEXT };
 		case "claude-opus-4-8":

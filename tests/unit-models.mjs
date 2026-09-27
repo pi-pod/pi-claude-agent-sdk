@@ -42,9 +42,10 @@ describe("MODELS projection", () => {
 	});
 
 	it("silently drops IDs missing from pi-ai unless a fallback stub exists", () => {
-		// Only haiku present — opus/sonnet vanish. Fable 5.1 is stubbed until pi-ai lists it.
+		// Only haiku present — opus/sonnet vanish. Fable 5.1 and Opus 5.5 are stubbed
+		// because the pinned pi-ai floor predates both ids.
 		const models = buildModels([mockPiAiModel("claude-haiku-4-5")]);
-		assert.deepEqual(models.map((m) => m.id), ["claude-fable-5-1", "claude-haiku-4-5"]);
+		assert.deepEqual(models.map((m) => m.id), ["claude-fable-5-1", "claude-opus-5-5", "claude-haiku-4-5"]);
 	});
 
 	it("prefers pi-ai's catalog entry over the fallback stub", () => {
@@ -52,6 +53,10 @@ describe("MODELS projection", () => {
 		const models = buildModels([fromCatalog]);
 		assert.equal(find(models, "claude-fable-5-1").name, "from-catalog");
 		assert.deepEqual(find(models, "claude-fable-5-1").thinkingLevelMap, { xhigh: "xhigh" });
+
+		const opusFromCatalog = { ...mockPiAiModel("claude-opus-5-5"), name: "opus-from-catalog" };
+		const opusModels = buildModels([opusFromCatalog]);
+		assert.equal(find(opusModels, "claude-opus-5-5").name, "opus-from-catalog");
 	});
 
 	it("zeros out cost regardless of pi-ai pricing", () => {
@@ -116,6 +121,7 @@ describe("Fable 5.1 thinking rules", () => {
 		assert.equal(adaptiveThinkingAlwaysOn("claude-fable-5-1[1m]"), true);
 		assert.equal(adaptiveThinkingAlwaysOn("claude-fable-5"), true);
 		assert.equal(adaptiveThinkingAlwaysOn("claude-opus-5"), false);
+		assert.equal(adaptiveThinkingAlwaysOn("claude-opus-5-5"), false);
 	});
 
 	it("binds thinking to the conversation prefix, unlike Fable 5", () => {
@@ -123,6 +129,7 @@ describe("Fable 5.1 thinking rules", () => {
 		assert.equal(thinkingBoundToPrefix("claude-fable-5-1[1m]"), true);
 		assert.equal(thinkingBoundToPrefix("claude-fable-5"), false);
 		assert.equal(thinkingBoundToPrefix("claude-opus-5"), false);
+		assert.equal(thinkingBoundToPrefix("claude-opus-5-5"), false);
 	});
 
 	it("requires Claude Code 2.1.251", () => {
@@ -130,6 +137,7 @@ describe("Fable 5.1 thinking rules", () => {
 		assert.equal(minClaudeCodeVersionForModel("claude-fable-5-1[1m]"), "2.1.251");
 		assert.equal(minClaudeCodeVersionForModel("claude-fable-5"), undefined);
 		assert.equal(minClaudeCodeVersionForModel("claude-opus-5"), undefined);
+		assert.equal(minClaudeCodeVersionForModel("claude-opus-5-5"), undefined);
 	});
 });
 
@@ -138,6 +146,7 @@ describe("claudeCodeModelId", () => {
 
 	it("returns the measured SDK request id", () => {
 		assert.equal(claudeCodeModelId(find(models, "claude-fable-5-1"), PRO), "claude-fable-5-1[1m]");
+		assert.equal(claudeCodeModelId(find(models, "claude-opus-5-5"), PRO), "claude-opus-5-5[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-5"), PRO), "claude-opus-5[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-4-8"), PRO), "claude-opus-4-8[1m]");
 		assert.equal(claudeCodeModelId(find(models, "claude-opus-4-7"), PRO), "claude-opus-4-7");
@@ -155,6 +164,7 @@ describe("applyLongContext", () => {
 	it("registers measured Pro defaults", () => {
 		const registered = applyLongContext(models, PRO);
 		assert.equal(find(registered, "claude-fable-5-1").contextWindow, 1000000);
+		assert.equal(find(registered, "claude-opus-5-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-4-8").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-4-7").contextWindow, 1000000);
@@ -197,7 +207,7 @@ describe("resolveModel", () => {
 	const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
 
 	it("opus shortcut resolves to claude-opus-5 (first opus in order)", () => {
-		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5");
+		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
 	});
 
 	it("fable shortcut resolves to claude-fable-5-1 (first fable in order)", () => {
@@ -221,7 +231,7 @@ describe("resolveModel", () => {
 	it("returns the matched model object for CLI-arg conversion", () => {
 		const oneMModels = buildModels(MODEL_IDS_IN_ORDER.map(oneM));
 		const model = resolveModel(oneMModels, "opus");
-		assert.equal(model.id, "claude-opus-5");
-		assert.equal(claudeCodeModelId(model, PRO), "claude-opus-5[1m]");
+		assert.equal(model.id, "claude-opus-5-5");
+		assert.equal(claudeCodeModelId(model, PRO), "claude-opus-5-5[1m]");
 	});
 });

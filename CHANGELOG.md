@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Add: claude-opus-5-5 model** — Claude Opus 5.5 is selectable via `/model` and the `opus` shortcut now points to it. 1M context at standard rates (no Extra Usage). A catalog stub covers the pinned pi-ai floor, which predates the id. No minimum Claude Code version.
+
 ## 0.8.6 — 2026-09-01
 
 - **Fix: standalone extension completions no longer fail prompt capture** — tool-free one-shot `modelRegistry.complete()` calls marked no-cache, including pi-verbatim-compaction's planner, run in isolated Claude Code subprocesses with their supplied system prompt and never touch the resumable chat session. Pi compaction and branch summaries use the same route, replacing the competing event takeovers that caused duplicate summary calls when another compaction extension was installed.
