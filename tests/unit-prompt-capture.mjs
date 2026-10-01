@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { after, before, beforeEach, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectPromptSkills, getSharedPromptCaptures, projectPromptCapture, PROMPT_CAPTURES_KEY, PromptCaptures } from "../src/prompt-capture.js";
+import { collectPromptSkills, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
 
 const PI_HARNESS = "You are an expert coding assistant operating inside pi. Pi documentation: pi packages (docs/packages.md).";
 const PARENT_KEY = `${PI_HARNESS}\n\n<project_context>raw parent context</project_context>\nCurrent working directory: /parent`;
@@ -108,19 +108,10 @@ describe("PromptCaptures", () => {
 
 		assert.throws(
 			() => captures.resolveOrDerive("a prompt sharing nothing with what we recorded"),
-			(err) => /no capture for this .* system prompt/.test(err.message)
-				&& !/another package root/.test(err.message),
+			/no capture for this .* system prompt/,
 		);
 		// No prompt at all is not a loss — there is nothing to forward.
 		assert.equal(captures.resolveOrDerive(undefined), undefined);
-	});
-
-	it("names a duplicate package root when nothing was ever recorded", () => {
-		const captures = new PromptCaptures();
-		assert.throws(
-			() => captures.resolveOrDerive("unrecorded"),
-			/second copy of this extension loaded from another package root/,
-		);
 	});
 
 	it("reports the closest known capture when a prompt matches nothing", () => {
@@ -139,6 +130,18 @@ describe("PromptCaptures", () => {
 		assert.equal(diagnostics.length, 1);
 		assert.equal(diagnostics[0].matches[0].key, "prefix-common-THE-REST");
 		assert.equal(diagnostics[0].matches[0].firstDivergent, 14);
+	});
+
+	it("names pi#5581 when a prompt is a recorded key with its tail missing", () => {
+		const captures = new PromptCaptures();
+		// The issue #144 shape: the next turn's prompt is the last recorded key with the
+		// extension's additions gone, because the idle triggerTurn skipped before_agent_start.
+		captures.record(`${PARENT_KEY}\n\n<skills>extension additions</skills>`, capture(), "turn_start");
+
+		assert.throws(
+			() => captures.resolveOrDerive(PARENT_KEY),
+			/pi#5581/,
+		);
 	});
 
 	it("recursively projects an inherited prompt without Pi's harness", () => {
@@ -269,45 +272,24 @@ describe("PromptCaptures", () => {
 	});
 });
 
-describe("getSharedPromptCaptures", () => {
-	let previous;
+describe("capture provenance", () => {
+	it("records which boundary last wrote a key", () => {
+		const captures = new PromptCaptures();
+		captures.record("key", capture(), "agent_start");
 
-	before(() => {
-		previous = globalThis[PROMPT_CAPTURES_KEY];
-	});
-	beforeEach(() => {
-		delete globalThis[PROMPT_CAPTURES_KEY];
-	});
-	after(() => {
-		if (previous === undefined) delete globalThis[PROMPT_CAPTURES_KEY];
-		else globalThis[PROMPT_CAPTURES_KEY] = previous;
+		assert.equal(captures.resolve("key").source, "agent_start");
+		captures.record("key", capture(), "turn_start");
+		assert.equal(captures.resolve("key").source, "turn_start", "a re-record replaces the earlier source");
 	});
 
-	it("reuses the first table so a later copy records where the first stream reads", () => {
-		let created = 0;
-		const first = getSharedPromptCaptures(() => {
-			created++;
-			return new PromptCaptures();
-		});
-		first.record("shared-key", capture({ custom: "from first copy" }));
+	it("names the closest match's boundary in a throw", () => {
+		const captures = new PromptCaptures();
+		captures.record("prefix-common-THE-REST", capture(), "agent_start");
 
-		const second = getSharedPromptCaptures(() => {
-			created++;
-			return new PromptCaptures();
-		});
-
-		assert.equal(created, 1);
-		assert.equal(second, first);
-		assert.equal(second.resolve("shared-key").custom, "from first copy");
-	});
-
-	it("does not replace a table stored by another copy of this module", () => {
-		// Another package root evaluates a different PromptCaptures class. instanceof
-		// would fail; the stored object must still win so the first copy's stream
-		// keeps seeing what later before_agent_start handlers record.
-		const foreign = { resolve() { return "foreign"; } };
-		globalThis[PROMPT_CAPTURES_KEY] = foreign;
-		const got = getSharedPromptCaptures(() => new PromptCaptures());
-		assert.equal(got, foreign);
+		assert.throws(
+			() => captures.resolveOrDerive("prefix-common-WHO-ARE-YOU"),
+			/recorded at agent_start/,
+			"the diagnostic must say which boundary last recorded the closest known prompt",
+		);
 	});
 });

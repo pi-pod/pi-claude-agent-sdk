@@ -34,12 +34,36 @@ export class QueryContext {
 	/** Highest 5% utilization bucket we notified for, so repeat rate_limit_event spam is suppressed. */
 	lastRateLimitWarnStep: number | null = null;
 	lastRateLimitWarnThreshold: number | undefined;
+	/** pi session this query serves, from SimpleStreamOptions.sessionId at fresh-query
+	 *  setup. A bridge process serves several pi sessions at once (subagents run their
+	 *  own AgentSessions), and history rewrites must only discard the rewriting
+	 *  session's parked queries — this is the match key. Null when the host did not
+	 *  supply an id.
+	 */
+	piSessionId: string | null = null;
+	/** pi rewrote the history this query was built from (session_compact,
+	 *  session_tree in its own pi session). Set by markRebuildForSession, consumed
+	 *  by the tool-result delivery that discards the query. Not session-wide state:
+	 *  it dies with the context it belongs to, so it cannot leak into later turns
+	 *  the way a module flag does.
+	 */
+	historyStale = false;
+	/** A steer never reached CC. A first query has no session mirror yet, so
+	 *  completion must carry this into the mirror it creates. */
+	missedSteer = false;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	/** API message id from the last message_start, and whether its message_stop has
+	 *  arrived. An `assistant` message under a different id while the stream is still
+	 *  open is Claude Code's non-streaming fallback for a stalled stream. */
+	turnStreamMessageId: string | undefined;
+	turnStreamOpen = false;
+	/** turnBlocks length at that message_start: where an abandoned attempt's blocks begin. */
+	turnStreamBlockStart = 0;
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -68,6 +92,9 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.turnStreamMessageId = undefined;
+		this.turnStreamOpen = false;
+		this.turnStreamBlockStart = 0;
 		// turnToolCallIds is NOT reset — it persists across tool-result delivery
 		// callbacks within the same assistant message so results can be routed to
 		// this query while its handlers are still pending.

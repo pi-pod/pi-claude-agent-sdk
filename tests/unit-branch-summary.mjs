@@ -8,14 +8,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { activateWithMockPi } from "./lib/mock-pi.mjs";
 
-const { default: activate, __test } = await import("../src/index.js");
-
-function activateWithMockPi() {
-	const handlers = new Map();
-	activate({ on: (event, handler) => handlers.set(event, handler), registerProvider: () => {} });
-	return handlers;
-}
+const { __test } = await import("../src/index.js");
 
 const user = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 
@@ -35,6 +30,18 @@ describe("standalone provider routing", () => {
 			__test.isStandaloneRequest({ messages: [user("a"), user("b")] }, { cacheRetention: "none" }),
 			false,
 		);
+	});
+
+	it("normalizes pi transcript summaries before standalone detection", () => {
+		const context = __test.toBridgeContext({
+			messages: [
+				{ role: "system", content: "planner", timestamp: 0 },
+				user("PLAN REQUEST"),
+			],
+		});
+		assert.equal(__test.isStandaloneRequest(context, { cacheRetention: "none" }), true);
+		assert.equal(context.systemPrompt, "planner");
+		assert.equal(__test.extractStandalonePrompt(context), "PLAN REQUEST");
 	});
 
 	it("accepts the one-user-message shape used by summaries and planners", () => {

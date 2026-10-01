@@ -11,7 +11,9 @@
 // as soon as the message they care about arrives. Run the whole file on every
 // @anthropic-ai/claude-agent-sdk or Claude Code bump.
 //
-// Verified against: SDK 0.3.257 / Claude Code 2.1.257.
+// Verified against: SDK 0.3.284 / Claude Code 2.1.284. package.json declares
+// ^0.3.284 and package-lock.json resolves 0.3.285 (Claude Code 2.1.285), which
+// has not been run through this file.
 //
 // Assumptions that are NOT covered here, and why:
 //   - DISABLE_AUTO_COMPACT=1 stops CC-side autocompaction. Provoking it needs a
@@ -251,6 +253,35 @@ test("includePartialMessages yields the stream_event shapes processStreamEvent d
 	}
 });
 
+test("message_delta usage carries thinking tokens nested under output_tokens_details", { timeout: 120_000 }, async () => {
+	// The bridge maps this onto pi's `usage.reasoning`. The nesting is the whole
+	// contract: updateUsage previously read a flat `usage.thinking_tokens` plus a
+	// `usage.reasoning_tokens` that exists in no SDK version, so it silently reported
+	// nothing on every thinking turn. If CC ever flattens or renames the field, this
+	// fails here instead of going quiet again.
+	const deltaUsages = [];
+	for await (const message of query({
+		prompt: "Think briefly about what 17 * 23 is, then state just the number.",
+		options: providerOptions({ includePartialMessages: true, effort: "medium", maxTurns: 1, persistSession: false }),
+	})) {
+		if (message.type === "stream_event" && message.event?.type === "message_delta" && message.event.usage) {
+			deltaUsages.push(message.event.usage);
+		}
+	}
+
+	assert.ok(deltaUsages.length > 0, "no message_delta carried usage");
+	const withThinking = deltaUsages.filter((u) => typeof u.output_tokens_details?.thinking_tokens === "number");
+	assert.ok(withThinking.length > 0,
+		`no message_delta reported output_tokens_details.thinking_tokens — got ${JSON.stringify(deltaUsages)}`);
+	for (const usage of withThinking) {
+		assert.ok(usage.output_tokens_details.thinking_tokens > 0, "a thinking turn must report a positive count");
+		assert.ok(usage.output_tokens_details.thinking_tokens <= usage.output_tokens,
+			`thinking_tokens must stay a subset of output_tokens: ${JSON.stringify(usage)}`);
+		assert.equal(usage.thinking_tokens, undefined, "a flat thinking_tokens would mean the shape changed");
+		assert.equal(usage.reasoning_tokens, undefined, "reasoning_tokens has never existed; a value means the shape changed");
+	}
+});
+
 test("a streamed prompt keeps the query open past result until the input generator ends", { timeout: 120_000 }, async () => {
 	// Passing an AsyncIterable makes isSingleUserTurn false, so the SDK no longer
 	// closes the CLI's stdin on the first result. That parked generator is what
@@ -369,8 +400,8 @@ test("--resume re-reads the JSONL from disk on every call", { timeout: 180_000 }
 });
 
 test("arbitrary sanitized tool_use ids in an imported transcript resume fine", { timeout: 120_000 }, async () => {
-	// convert.ts keeps safe, bounded pi IDs rather than rewriting every foreign
-	// call into CC's toolu_* form.
+	// convert.ts sanitizeToolId only strips characters outside [A-Za-z0-9_-]; the
+	// result keeps pi's own id shape rather than CC's toolu_* form.
 	const sessionId = randomUUID();
 	const session = createSession({ sessionId, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
 	session.importMessages(repairToolPairing([
@@ -513,17 +544,22 @@ function stubApi(requests) {
 	})));
 }
 
+/** cache_control markers are breakpoint directives, not cache-keyed content — CC 2.1.280
+ *  moves them (and a 1h ttl) between turns, so payload comparisons strip them. */
+const sansCacheControl = (m) => JSON.parse(JSON.stringify(m, (_k, v) => (v === null || v === undefined) ? v : (typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).filter(([key]) => key !== "cache_control")) : v)));
+
 test("includeGitInstructions:false strips gitStatus and keeps the preset static across git transitions", { timeout: 180_000 }, async () => {
 	// The claude_code preset embeds a gitStatus snapshot (git status --short +
-	// log -n 5) as the trailing suffix of the cached system block, and the
-	// bridge re-invokes CC every turn — so a git transition rewrites it and
-	// busts the prompt cache for the whole conversation from the system prompt
-	// onward (diag/probe-git-cache.mjs). The provider path sets
-	// includeGitInstructions:false for this reason; pin both sides: without it
-	// the block is present AND a git transition moves it (the break itself),
-	// with it the block is gone and the system prompt is byte-identical
-	// across a transition. This pins CC's behavior, not the bridge's call
-	// site — src/index.ts's provider options are the consumer.
+	// log -n 5), and the bridge re-invokes CC every turn — so a git transition
+	// rewrites it and busts the prompt cache for the whole conversation
+	// (diag/probe-git-cache.mjs). CC has moved the snapshot between the cached
+	// system block and the leading user message before; wherever it rides, the
+	// provider's includeGitInstructions:false strips it. Pin both sides: without
+	// the setting the snapshot is present AND a git transition moves it (the
+	// break itself); with it the snapshot is gone and the system blocks plus the
+	// leading user message are byte-identical across a transition. This pins
+	// CC's behavior, not the bridge's call site — src/index.ts's provider
+	// options are the consumer.
 	const requests = [];
 	const api = await stubApi(requests);
 	const repo = mkdtempSync(join(tmpdir(), "cc-gitpin-"));
@@ -544,15 +580,25 @@ test("includeGitInstructions:false strips gitStatus and keeps the preset static 
 		// compare those and pass for the wrong reason.
 		const presetReqs = () => requests.filter((b) => sysText(b).includes("You are an interactive agent"));
 
-		// Control: default preset carries the block, and a git transition moves
-		// it — the very break this test's positive side pins away.
-		const ctrl = await collect(query({ prompt: "Reply OK.", options: opts({}) }));
-		assert.ok(sysText(requests.at(-1)).includes("gitStatus:"),
+		// Control: default preset carries the git snapshot, and a git transition
+		// moves it — the very break this test's positive side pins away. Grep the
+		// whole request body rather than a specific block: CC 2.1.280 delivers the
+		// snapshot as a <system-reminder> in the leading user message instead of
+		// the system blocks, and it may move again. Both turns are fresh (no
+		// resume): a resumed conversation echoes msg[0] from session start, while
+		// the bridge's rebuild path re-invokes fresh and recomputes it — the shape
+		// where the break lives.
+		await collect(query({ prompt: "Reply OK.", options: opts({}) }));
+		const ctrlFirst = requests.at(-1);
+		assert.ok(JSON.stringify(ctrlFirst).includes("gitStatus"),
 			"the preset no longer carries a gitStatus block — this test's negative side is obsolete");
 		writeFileSync(join(repo, "ctrl-new.txt"), "x\n");
-		await collect(query({ prompt: "Reply OK.", options: opts({}, ctrl.result?.session_id) }));
-		assert.notDeepEqual(presetReqs().at(-2).system.slice(1), presetReqs().at(-1).system.slice(1),
-			"a git transition did not move the system prompt without the setting — the break this test guards no longer exists");
+		await collect(query({ prompt: "Reply OK.", options: opts({}) }));
+		const [c1, c2] = [presetReqs().at(-2), presetReqs().at(-1)];
+		assert.ok(JSON.stringify(c1.messages[0]).includes("gitStatus") && JSON.stringify(c2.messages[0]).includes("gitStatus"),
+			"git snapshot no longer rides in the leading user message — re-point this control");
+		assert.notDeepEqual(sansCacheControl(c1.messages[0]), sansCacheControl(c2.messages[0]),
+			"a git transition did not move the git snapshot without the setting — the break this test guards no longer exists");
 
 		// With the setting: baseline, then a git transition, then resume.
 		const base = await collect(query({ prompt: "Reply OK.", options: opts({ includeGitInstructions: false }) }));
@@ -562,14 +608,18 @@ test("includeGitInstructions:false strips gitStatus and keeps the preset static 
 
 		const [turn1, turn2] = presetReqs().slice(-2);
 		for (const body of [turn1, turn2]) {
-			assert.ok(!JSON.stringify({ system: body.system, messages: body.messages }).includes("gitStatus:"),
+			assert.ok(!JSON.stringify({ system: body.system, messages: body.messages }).includes("gitStatus"),
 				"a gitStatus block survived includeGitInstructions:false");
 		}
-		// Block 0 is the per-request billing header (cch hex), ignored by the
-		// cache key; everything after it must be byte-identical across the
-		// transition for the cache to hold.
-		assert.deepEqual(turn1.system.slice(1), turn2.system.slice(1),
+		// The prompt cache keys the whole request body: the system blocks and the
+		// leading user message must be byte-identical across the transition.
+		// (Block 0 of `system` is a per-request billing header, hence slice(1);
+		// later blocks may legitimately carry moved cache_control markers, which are
+		// breakpoint directives, not cache-keyed content.)
+		assert.deepEqual(sansCacheControl(turn1.system).slice(1), sansCacheControl(turn2.system).slice(1),
 			"system prompt changed across a git transition despite includeGitInstructions:false");
+		assert.deepEqual(sansCacheControl(turn1.messages[0]), sansCacheControl(turn2.messages[0]),
+			"leading user message changed across a git transition despite includeGitInstructions:false");
 	} finally {
 		api.close();
 		rmSync(repo, { recursive: true, force: true });
