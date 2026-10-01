@@ -1,6 +1,6 @@
 # Changelog
 
-## UNRELEASED
+## 0.9.0 — 2026-10-01
 
 - **Bump: sync upstream through v0.9.1** — require pi ≥0.86.1, update the Agent SDK to ^0.3.284 and development peers to pi 0.99.1; adopt catalog-driven models including Opus/Sonnet 5.5, transcript replay, session-safe mid-turn rebuilds, prompt-capture fixes, reasoning usage, and agent-dir logging while preserving Pi authentication, standalone completions, Max defaults, and the provider-only fork.
 

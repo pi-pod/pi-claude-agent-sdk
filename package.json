@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-agent-sdk",
-  "version": "0.8.6",
+  "version": "0.9.0",
   "private": false,
   "description": "Pi extension that uses Claude Code (via Agent SDK) as a model provider.",
   "keywords": [
