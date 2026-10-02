@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.2 — 2026-10-01
+
+- **Fix: long turns failing with "401 OAuth access token has expired"** — Claude Code keeps the OAuth token it was spawned with for the whole turn and can't refresh it, while Pi only refreshes a token with under five minutes left, so a turn that outlived its token failed until the next prompt. The bridge now asks Pi for at least two hours of validity before spawning, through `ModelRuntime.getAuth`'s `minOAuthValidityMs` (Pi's public `getProviderAuth` takes no overrides), falling back to `getProviderAuth` if that fails. Covered by `tests/unit-child-env.mjs` against Pi's real registry.
+
 ## 0.9.0 — 2026-10-01
 
 - **Bump: sync upstream through v0.9.1** — require pi ≥0.86.1, update the Agent SDK to ^0.3.284 and development peers to pi 0.99.1; adopt catalog-driven models including Opus/Sonnet 5.5, transcript replay, session-safe mid-turn rebuilds, prompt-capture fixes, reasoning usage, and agent-dir logging while preserving Pi authentication, standalone completions, Max defaults, and the provider-only fork.
