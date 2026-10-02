@@ -4,10 +4,13 @@
  * on its own, nothing throws, and the damage shows up in the user's ~/.claude
  * rather than in a test.
  */
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 
-const { CC_CHILD_ENV, buildClaudeChildEnv, resolveClaudeChildEnv } = await import("../src/child-env.js");
+const { CC_CHILD_ENV, CHILD_OAUTH_MIN_VALIDITY_MS, buildClaudeChildEnv, resolveClaudeChildEnv, resetChildAuthState } =
+	await import("../src/child-env.js");
 
 describe("Claude Code child environment", () => {
 	it("disables auto-compaction and claude.ai MCP servers", () => {
@@ -104,4 +107,90 @@ describe("Claude Code child environment", () => {
 	// Deliberately not asserted here: that every `query()` call site awaits the
 	// helper. Grepping source would fail on innocent indirection and read as
 	// coverage; the integration auth test exercises the actual child process.
+});
+
+/**
+ * A child keeps the OAuth token it was spawned with for its whole turn and can't
+ * refresh it, so a token handed over with minutes left fails the turn with
+ * "401 OAuth access token has expired". The bridge asks pi for a longer minimum
+ * through ModelRuntime.getAuth, which pi's public getProviderAuth doesn't expose.
+ */
+describe("OAuth validity for Claude Code children", () => {
+	const realFetch = globalThis.fetch;
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+		resetChildAuthState();
+	});
+
+	async function realRegistry(expiresInMs) {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("anthropic", async () => ({
+			type: "oauth", access: "stale-access", refresh: "refresh-token", expires: Date.now() + expiresInMs,
+		}));
+		const runtime = await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false });
+		return { registry: new ModelRegistry(runtime), credentials };
+	}
+
+	function stubTokenEndpoint(expiresInSeconds) {
+		const requests = [];
+		globalThis.fetch = async (url, init) => {
+			requests.push({ url: String(url), body: JSON.parse(init.body) });
+			return new Response(JSON.stringify({
+				access_token: "fresh-access", refresh_token: "rotated-refresh", expires_in: expiresInSeconds,
+			}), { status: 200 });
+		};
+		return requests;
+	}
+
+	// Pins the private seam against the installed pi: if ModelRegistry stops
+	// holding `runtime` or getAuth drops minOAuthValidityMs, this fails rather
+	// than the bridge silently reverting to pi's five-minute window.
+	it("refreshes through pi a token pi itself would still hand out", async () => {
+		const { registry, credentials } = await realRegistry(60 * 60 * 1000);
+		const requests = stubTokenEndpoint(8 * 60 * 60);
+		assert.equal((await registry.getProviderAuth("anthropic")).auth.apiKey, "stale-access", "pi's default window keeps a one-hour token");
+		assert.equal(requests.length, 0);
+
+		const env = await resolveClaudeChildEnv(registry, {});
+		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "fresh-access");
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0].body.grant_type, "refresh_token");
+		assert.equal((await credentials.read("anthropic")).refresh, "rotated-refresh", "the rotated credential is persisted");
+	});
+
+	it("leaves a token with more than the minimum alone", async () => {
+		const { registry } = await realRegistry(CHILD_OAUTH_MIN_VALIDITY_MS + 60 * 60 * 1000);
+		const requests = stubTokenEndpoint(8 * 60 * 60);
+		const env = await resolveClaudeChildEnv(registry, {});
+		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "stale-access");
+		assert.equal(requests.length, 0);
+	});
+
+	it("stops asking for the minimum once the provider can't meet it", async () => {
+		const { registry } = await realRegistry(60 * 60 * 1000);
+		// One-hour tokens: every refresh comes back short of a two-hour minimum.
+		const requests = stubTokenEndpoint(60 * 60);
+		assert.equal((await resolveClaudeChildEnv(registry, {})).CLAUDE_CODE_OAUTH_TOKEN, "fresh-access");
+		assert.equal(requests.length, 1);
+		await resolveClaudeChildEnv(registry, {});
+		await resolveClaudeChildEnv(registry, {});
+		assert.equal(requests.length, 1, "no refresh per spawn");
+	});
+
+	it("falls back to getProviderAuth when the runtime call fails or is absent", async () => {
+		const fallback = { async getProviderAuth() { return { auth: { apiKey: "public-token" }, source: "OAuth" }; } };
+		assert.equal((await resolveClaudeChildEnv(fallback, {})).CLAUDE_CODE_OAUTH_TOKEN, "public-token");
+
+		const overrides = [];
+		const failing = {
+			...fallback,
+			runtime: { async getAuth(_provider, o) { overrides.push(o); throw new Error("OAuth refresh failed for anthropic"); } },
+		};
+		assert.equal((await resolveClaudeChildEnv(failing, {})).CLAUDE_CODE_OAUTH_TOKEN, "public-token");
+		await resolveClaudeChildEnv(failing, {});
+		assert.deepEqual(overrides, [
+			{ minOAuthValidityMs: CHILD_OAUTH_MIN_VALIDITY_MS },
+			{ minOAuthValidityMs: CHILD_OAUTH_MIN_VALIDITY_MS },
+		], "a transient refresh failure doesn't disable the minimum");
+	});
 });

@@ -65,10 +65,49 @@ export function buildClaudeChildEnv(
 	return env;
 }
 
+/** Remaining validity an OAuth token must have before it is handed to a child.
+ *
+ * A child keeps the token it was spawned with for its whole turn and cannot
+ * refresh it (it never sees the refresh token), so a turn that outlives the
+ * token fails with "401 OAuth access token has expired". Pi's default refresh
+ * window is five minutes; asking for more refreshes early instead. Anthropic
+ * access tokens last about eight hours, so this costs one extra refresh per
+ * cycle and leaves only turns longer than this exposed.
+ */
+export const CHILD_OAUTH_MIN_VALIDITY_MS = 2 * 60 * 60 * 1000;
+
+interface AnthropicAuthRuntime {
+	getAuth(provider: string, overrides?: { minOAuthValidityMs?: number }): Promise<AuthResult | undefined>;
+}
+
+// Latched when the provider issues tokens shorter than the minimum: pi refreshes
+// and then rejects the result, so retrying would refresh on every child spawn.
+let minValidityUnsatisfiable = false;
+
+/** Pi's public getProviderAuth() takes no overrides, but is a pass-through to
+ * ModelRuntime.getAuth(), which accepts minOAuthValidityMs. Reach the runtime
+ * when it is there and fall back to the public call otherwise. */
+async function resolveAnthropicAuth(registry: AnthropicAuthRegistry): Promise<AuthResult | undefined> {
+	const runtime = (registry as { runtime?: Partial<AnthropicAuthRuntime> }).runtime;
+	if (!minValidityUnsatisfiable && typeof runtime?.getAuth === "function") {
+		try {
+			return await runtime.getAuth("anthropic", { minOAuthValidityMs: CHILD_OAUTH_MIN_VALIDITY_MS });
+		} catch (err) {
+			if (/expires too soon/i.test(err instanceof Error ? err.message : String(err))) minValidityUnsatisfiable = true;
+		}
+	}
+	return registry.getProviderAuth("anthropic");
+}
+
 export async function resolveClaudeChildEnv(
 	registry: AnthropicAuthRegistry | null | undefined,
 	base: NodeJS.ProcessEnv = process.env,
 ): Promise<NodeJS.ProcessEnv> {
-	const resolved = registry ? await registry.getProviderAuth("anthropic") : undefined;
+	const resolved = registry ? await resolveAnthropicAuth(registry) : undefined;
 	return buildClaudeChildEnv(base, resolved);
+}
+
+/** Test hook: clear the unsatisfiable-minimum latch. */
+export function resetChildAuthState(): void {
+	minValidityUnsatisfiable = false;
 }

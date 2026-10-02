@@ -29,7 +29,7 @@ Fable 5.1 needs Claude Code **2.1.251 or newer**. If an explicitly configured CL
 
 Behind the scenes, pi's tools are bridged to Claude Code but everything works like normal in pi. Bash commands get Claude Code's 120-second default timeout since pi's bash has none. Skills are forwarded to Claude Code's system prompt, and steering mid-turn reaches Claude at the next tool boundary.
 
-**Authentication:** the bridge requires an Anthropic OAuth credential (or API key) configured in Pi and uses Pi's normal token refresh. Claude Code login and inherited Claude/Anthropic authentication settings are deliberately ignored, so configure Anthropic authentication in Pi before using the provider.
+**Authentication:** the bridge requires an Anthropic OAuth credential (or API key) configured in Pi and uses Pi's token refresh, renewing an OAuth token with less than two hours left before it starts a Claude Code turn (a turn keeps the token it started with). Claude Code login and inherited Claude/Anthropic authentication settings are deliberately ignored, so configure Anthropic authentication in Pi before using the provider.
 
 The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai adds a new Claude model, it appears in `/model` after updating the package, no bridge update needed. Dated snapshot ids (e.g. `claude-opus-4-5-20251101`) are not shown.
 
