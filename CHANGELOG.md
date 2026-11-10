@@ -1,6 +1,6 @@
 # Changelog
 
-## UNRELEASED
+## 0.12.1 — 2026-11-10
 
 - **Bump: sync upstream through v0.12.0** — require pi ≥1.5.1, pin Agent SDK 0.3.321 (Claude Code 2.1.321), and update cc-session-io to ^0.4.1. Adds Fable 5.2 and Haiku 5.5 at 1M; adopts upstream's thinking-off support, plan-usage headers, Extra Usage warnings, and cache diagnostics. Removes the obsolete system-prompt guard for pi 1.5.
 - **Fix: retain matching Claude Code history across edits and restarts** — content-digest synchronization preserves safe native prefixes, prompt cache and thinking across forks, rewinds, interruptions and foreign-provider turns. Session pointers persist under pi's agent directory; changed instructions force a fresh import. Tool results remain scoped to their owning session, empty error results receive valid placeholders, and normalized tool arguments no longer cause spurious rebuilds.
