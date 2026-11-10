@@ -30,6 +30,8 @@ describe("fork contracts retained across upstream sync", () => {
 			assert.equal(thinkingBoundToPrefix(id), true);
 			assert.equal(minClaudeCodeVersionForModel(id), "2.1.251");
 		}
+		assert.equal(adaptiveThinkingAlwaysOn("claude-fable-5-2"), true);
+		assert.equal(minClaudeCodeVersionForModel("claude-fable-5-2[1m]"), "2.1.321");
 		assert.equal(adaptiveThinkingAlwaysOn("claude-fable-5"), true);
 		assert.equal(thinkingBoundToPrefix("claude-fable-5"), false);
 		assert.equal(adaptiveThinkingAlwaysOn("claude-opus-5-5"), false);

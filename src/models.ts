@@ -2,15 +2,12 @@
 // driven by pi-ai's anthropic catalog: models appear (and disappear) with it,
 // no per-model code here. Extracted from index.ts so tests can import without
 // activating the extension.
-// `resolveModel` resolves family shortcuts (opus/sonnet/fable) to the newest
-// matching id regardless of sort order; sort order only drives picker display.
 
 const TWO_HUNDRED_K_CONTEXT = 200_000;
 const ONE_M_CONTEXT = 1_000_000;
 
 // pi-ai ships dated snapshot ids (claude-opus-4-5-20251101, ...) alongside the
-// bare ids. They are never exposed - and must not steal first-partial-match
-// shortcuts like "opus-4-5" from the bare id.
+// bare ids. They are never exposed.
 function isDatedAlias(id: string): boolean {
 	return /-20\d{6}$/.test(id);
 }
@@ -22,8 +19,7 @@ const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
 // newest generation first. Context-dependent display labels are applied after
 // plan/long-context config is known.
-// Version rank of a claude id, e.g. claude-opus-4-7 → ["opus", 4, 7]. Shared by
-// the display sort and resolveModel's newest-first partial tiebreak.
+// Version rank of a claude id, e.g. claude-opus-4-7 → ["opus", 4, 7], for the display sort.
 function versionRank(id: string): { family: string; tuple: [number, number] } {
 	const [, family, major, minor] = id.split("-");
 	return { family, tuple: [Number(major) || 0, Number(minor) || 0] };
@@ -63,33 +59,36 @@ export type LongContextSettings = {
 	forceTwoHundredK?: string[];
 };
 
-export type ClaudeCodeRuntimeModel = {
+type ClaudeCodeRuntimeModel = {
 	cliModelId: string;
 	contextWindow: number;
 };
 
 // Measured Claude Agent SDK behavior - see diag/CONTEXT-SIZE.md:
-// - The `[1m]` suffix is the only reliable way to request 1M context through
-//   the SDK; bare ids serve 200K.
+// - The `[1m]` suffix is the reliable way to request 1M context through the
+//   SDK. Bare ids serve 1M for current models on Pro, but older models and some
+//   Max-plan measurements serve 200K.
 // - An unentitled `[1m]` id is rejected outright (400/429), failing every turn
 //   — worse than serving 200K, so the default is bare id at 200K and only
 //   measured-good ids get `[1m]`.
 // - The registered contextWindow must match the window the bridge actually
 //   requests, or pi's status bar and compaction threshold misreport.
-// [1m] ids verified to serve 1M on every plan (sonnet-5-5 measured on Pro with
-// and without Extra Usage; opus-5-5 on Max per its run notes). A new model
+// [1m] ids that serve 1M on every plan (sonnet-5-5 measured on Pro with and
+// without Extra Usage; opus-5-5 and fable-5-2 on Max). A new model
 // serves 200K until someone measures it (diag/context-size.mjs) and adds it
 // here. Known exception unrelated to long context: fable-5 is not included
 // with Pro account without Extra Usage.
 const MEASURED_ONE_M = new Set([
 	"claude-fable-5",
 	"claude-fable-5-1",
+	"claude-fable-5-2",
 	"claude-opus-5-5",
 	"claude-opus-5",
 	"claude-opus-4-8",
 	"claude-opus-4-7",
   "claude-sonnet-5",
 	"claude-sonnet-5-5",
+	"claude-haiku-5-5",
 ]);
 
 // Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when
@@ -128,41 +127,28 @@ export function claudeCodeModelId(model: { id: string }, settings: LongContextSe
 	return resolveClaudeCodeRuntimeModel(model, settings).cliModelId;
 }
 
-/** Fable adaptive thinking cannot be disabled and needs summarized display. */
+/** Fable adaptive thinking is always enabled, including without an effort level. */
 export function adaptiveThinkingAlwaysOn(modelId: string): boolean {
-	return modelId === "claude-fable-5-1" || modelId.startsWith("claude-fable-5-1[")
-		|| modelId === "claude-fable-5" || modelId.startsWith("claude-fable-5[");
+	return /^claude-fable-5(?:-[12])?(?:\[|$)/.test(modelId);
 }
 
-/** Fable 5.1 thinking signatures bind to the original conversation prefix, so
- *  rebuilt sessions must drop them; ordinary resume can preserve them. */
+/** A full import rewrites the prefix to which Fable 5.1 thinking is bound. */
 export function thinkingBoundToPrefix(modelId: string): boolean {
-	return modelId === "claude-fable-5-1" || modelId.startsWith("claude-fable-5-1[");
+	return /^claude-fable-5-1(?:\[|$)/.test(modelId);
 }
 
-/** Minimum CLI version accepted by Fable 5.1. */
 export function minClaudeCodeVersionForModel(modelId: string): string | undefined {
-	if (modelId === "claude-fable-5-1" || modelId.startsWith("claude-fable-5-1[")) return "2.1.251";
+	if (/^claude-fable-5-2(?:\[|$)/.test(modelId)) return "2.1.321";
+	if (/^claude-fable-5-1(?:\[|$)/.test(modelId)) return "2.1.251";
 	return undefined;
 }
 
-export function resolveModel<T extends { id: string }>(models: T[], input: string): T | undefined {
-	const lower = input.toLowerCase();
-	// Exact first, then partial (mirrors pi's tryMatchModel ordering), so a
-	// longer newer id containing the input (claude-fable-5-1 vs "claude-fable-5")
-	// cannot shadow the exact match.
-	return models.find((m) => m.id === lower)
-		?? newestPartialMatch(models.filter((m) => m.id.includes(lower)));
-}
-
-// Newest match by version rank — independent of registration order.
-function newestPartialMatch<T extends { id: string }>(candidates: T[]): T | undefined {
-	if (candidates.length === 0) return undefined;
-	return candidates.reduce((best, m) => {
-		const [vb, vbest] = [versionRank(m.id).tuple, versionRank(best.id).tuple];
-		const newer = vb[0] !== vbest[0] ? vb[0] > vbest[0] : vb[1] > vbest[1];
-		return newer ? m : best;
-	});
+/** The model runs at 1M only because the user chose to pay for it through Extra
+ *  Usage, so its requests bill there with the plan limit not reached. */
+export function extraUsageByChoice(model: { id: string }, settings: LongContextSettings): boolean {
+	const planGate = PLAN_GATED_ONE_M[model.id];
+	return !!planGate && settings.longContextExtraUsage && !settings.forceTwoHundredK?.includes(model.id)
+		&& !planGate({ ...settings, longContextExtraUsage: false });
 }
 
 // Produce the model metadata registered with pi. The registered contextWindow must

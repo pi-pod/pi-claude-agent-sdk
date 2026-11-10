@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // Context continuity test for pi-claude-bridge provider.
 // Verifies that switching away from the provider and back correctly
-// preserves conversation context (all messages are flattened into
-// each query, so "missed" messages are automatically included).
+// preserves conversation context through native-prefix retention and suffix import.
 //
 // Requires: pi CLI, Claude Code (for Agent SDK subprocess).
 // Requires: CLAUDE_BRIDGE_TESTING_ALT_PROVIDER (e.g. "minimax")
@@ -19,7 +18,7 @@ const OTHER_PROVIDER = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_PROVIDER");
 const OTHER_MODEL = requireEnv("CLAUDE_BRIDGE_TESTING_ALT_MODEL");
 
 const TIMEOUT = 180_000;
-const BRIDGE_MODEL = "claude-bridge/claude-haiku-4-5";
+const BRIDGE_MODEL = "claude-bridge/claude-haiku-5-5";
 
 // Random words to avoid Claude memorizing test values across runs
 const WORD_A = `alpha${Math.random().toString(36).slice(2, 6)}`;
@@ -37,7 +36,13 @@ const harness = createRpcHarness({
 	defaultTimeout: TIMEOUT,
 });
 
-const { startAndWait, stop, send, waitForEvent, promptAndWait, DEBUG_LOG, RPC_LOG } = harness;
+const { startAndWait, stop, send, promptAndWait, waitForEvent, waitForMatch, DEBUG_LOG, RPC_LOG } = harness;
+
+function latestSync() {
+	const last = [...readFileSync(DEBUG_LOG, "utf8").matchAll(/syncResult: path=([a-z-]+) sessionId=([a-f0-9-]+)/g)].at(-1);
+	if (!last) throw new Error("no syncResult session marker found");
+	return { path: last[1], sessionId: last[2] };
+}
 
 // Start pi
 await startAndWait();
@@ -54,6 +59,7 @@ try {
   console.log(`Switching to ${BRIDGE_MODEL}...`);
   await send({ type: "set_model", provider: bridgeProvider, modelId: bridgeModelId });
 
+
   // Turn 2: First provider turn — should see WORD_A from prior non-provider history
   console.log("Turn 2: First provider turn with prior history (Case 2)...");
   const text2 = await promptAndWait(
@@ -63,23 +69,23 @@ try {
   const lower2 = text2.toLowerCase();
   if (!lower2.includes(WORD_A)) throw new Error(`Turn 2 response missing '${WORD_A}': ${text2}`);
   if (!lower2.includes(WORD_B)) throw new Error(`Turn 2 response missing '${WORD_B}': ${text2}`);
-
-  // Switch to other model — creates missed messages
-  console.log(`Switching to ${OTHER_PROVIDER}/${OTHER_MODEL}...`);
-  await send({ type: "set_model", provider: OTHER_PROVIDER, modelId: OTHER_MODEL });
+  const firstProviderSession = latestSync().sessionId;
 
   // Turn 3: Non-provider prompt — adds context that provider must see on switch-back
+  console.log(`Switching to ${OTHER_PROVIDER}/${OTHER_MODEL}...`);
+  await send({ type: "set_model", provider: OTHER_PROVIDER, modelId: OTHER_MODEL });
   console.log("Turn 3: Non-provider prompt (creates missed messages)...");
   const text3 = await promptAndWait(`The third word is '${WORD_C}'. Acknowledge and be very brief.`);
   if (!text3) throw new Error("Turn 3 produced no text");
   console.log(`  Response: ${text3.slice(0, 80)}`);
 
-  // Switch back to provider — context includes all prior turns (Case 4)
+  // Switch back to provider with the intervening non-provider turn.
   console.log(`Switching back to ${BRIDGE_MODEL}...`);
   await send({ type: "set_model", provider: bridgeProvider, modelId: bridgeModelId });
 
-  // Turn 4: Provider resumes with missed messages (Case 4)
-  console.log("Turn 4: Provider resume with missed messages (Case 4)...");
+
+  // Turn 4: retain the native prefix and import the new non-provider history.
+  console.log("Turn 4: Provider continuation after non-provider turns...");
   const text4 = await promptAndWait(
     "What were all three words? Reply with just the three words separated by commas."
   );
@@ -88,20 +94,24 @@ try {
   if (!lower4.includes(WORD_A)) throw new Error(`Turn 4 response missing '${WORD_A}': ${text4}`);
   if (!lower4.includes(WORD_B)) throw new Error(`Turn 4 response missing '${WORD_B}': ${text4}`);
   if (!lower4.includes(WORD_C)) throw new Error(`Turn 4 response missing '${WORD_C}': ${text4}`);
+  const continued = latestSync();
+  if (continued.path !== "prefix-write") throw new Error(`expected prefix-write after foreign turns, got ${continued.path}`);
+  if (continued.sessionId === firstProviderSession) throw new Error("foreign turns overwrote the ancestor session");
 
-  // Turn 5: Abort mid-stream — session should be invalidated, next turn should recover
+  // Turn 5: abort observed streaming, not a timer that may outlast the reply.
   console.log("Turn 5: Abort mid-stream (session recovery)...");
-  await send({ type: "prompt", message: "Write a detailed 500-word essay about the history of timekeeping." });
-  // Set up idle listener before abort so we don't miss agent_end
+  const streaming = waitForMatch((m) => m.type === "message_update" && m.assistantMessageEvent?.type === "text_delta", "streamed text", TIMEOUT);
   const idle5 = waitForEvent("agent_end", TIMEOUT);
-  await new Promise((r) => setTimeout(r, 2000));
+  await send({ type: "prompt", message: "Write a detailed 4,000-word essay about the history of timekeeping." });
+  await streaming;
   await send({ type: "abort" });
   await idle5;
+
 
   // Turn 6: Provider turn after abort — should NOT get "conversation not found"
   console.log("Turn 6: Provider turn after abort (should recover)...");
   const text6 = await promptAndWait(
-    "What were all three words from earlier? Reply with just the three words separated by commas."
+    "What were all three words? Reply with just the three words separated by commas."
   );
   console.log(`  Response: ${text6.slice(0, 80)}`);
   const lower6 = text6.toLowerCase();
@@ -109,26 +119,10 @@ try {
   if (!lower6.includes(WORD_B)) throw new Error(`Turn 6 response missing '${WORD_B}': ${text6}`);
   if (!lower6.includes(WORD_C)) throw new Error(`Turn 6 response missing '${WORD_C}': ${text6}`);
 
-  // sessionId stability: sessionId should stay stable across normal
-  // rebuilds (Case 2 → Case 4 → Case 3). It's allowed to rotate exactly
-  // once per abort: the post-abort rebuild takes a fresh UUID on purpose,
-  // to avoid a race with the killed CC subprocess's late interrupt-cleanup
-  // writes (which would otherwise append an orphan record at the same
-  // path and break the parent-uuid chain for the next resume).
-  //
-  // This test exercises one abort (Turn 5), so we expect exactly 2 unique
-  // sessionIds: pre-abort and post-abort.
-  const debugLog = readFileSync(DEBUG_LOG, "utf8");
-  const sessionIds = new Set();
-  const rotatedPostAbort = [];
-  for (const match of debugLog.matchAll(/syncResult: path=(reuse|rebuild) sessionId=([a-f0-9-]+)(?: priors=\d+ (\S+))?/g)) {
-    sessionIds.add(match[2]);
-    if (match[3] === "rotated-post-abort") rotatedPostAbort.push(match[2]);
-  }
-  if (sessionIds.size === 0) throw new Error("no syncResult markers found in debug log");
-  if (sessionIds.size > 2) throw new Error(`expected ≤2 distinct sessionIds (one pre-abort, one post-abort rotation), got ${sessionIds.size}: ${[...sessionIds].join(", ")}`);
-  if (rotatedPostAbort.length !== 1) throw new Error(`expected exactly 1 post-abort rotation, got ${rotatedPostAbort.length}`);
-  console.log(`  sessionIds observed: ${sessionIds.size} (expected 2 due to 1 post-abort rotation)`);
+  const recovered = latestSync();
+  if (!["fork", "prefix-write"].includes(recovered.path)) throw new Error(`expected a retained-prefix recovery, got ${recovered.path}`);
+  if (recovered.sessionId === continued.sessionId) throw new Error("abort recovery reused the interrupted transcript");
+  console.log(`  Recovery: ${recovered.path} into a new session`);
 
   console.log("PASS");
 } catch (e) {
@@ -136,12 +130,9 @@ try {
   console.log(`FAIL: ${e.message}\n${e.stack}`);
   console.log(`  RPC log:    ${RPC_LOG}`);
   console.log(`  Debug log:  ${DEBUG_LOG}`);
-  console.log(`  CC CLI:     .test-output/cc-cli-logs/`);
-  console.log(`  Note: logs are overwritten on next test run — copy them now if you need to investigate.`);
 } finally {
   await stop();
   if (TEST_CWD.startsWith(TEST_CWD_PREFIX) && TEST_CWD.length > TEST_CWD_PREFIX.length) {
     rmSync(TEST_CWD, { recursive: true, force: true });
   }
 }
-

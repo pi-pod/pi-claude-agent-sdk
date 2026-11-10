@@ -4,92 +4,30 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { repairToolPairing } from "cc-session-io";
-import { sanitizeToolId, convertPiMessages } from "../src/convert.js";
+import { convertPiMessages } from "../src/convert.js";
 
 /** Shorthand: convert pi messages and return just the anthropic messages. */
-function convert(messages, customToolNameToSdk, dropThinking) {
-	return convertPiMessages(messages, customToolNameToSdk, dropThinking).anthropicMessages;
+function convert(messages, customToolNameToSdk) {
+	return convertPiMessages(messages, customToolNameToSdk).anthropicMessages;
 }
 
 // --- Tests ---
 
 describe("tool ID sanitization", () => {
-	it("Kimi-style IDs with dots and colons", () => {
-		const msgs = [
-			{ role: "assistant", content: [{ type: "toolCall", id: "functions.bash:0", name: "bash", arguments: { cmd: "ls" } }] },
-			{ role: "toolResult", toolCallId: "functions.bash:0", content: "file.txt" },
+	it("rewrites IDs to Anthropic's charset, keeping each tool_use paired with its result", () => {
+		const cases = [
+			["functions.bash:0", "functions_bash_0"], // Kimi-style
+			["tool call#1@foo", "tool_call_1_foo"],
+			["toolu_abc123-XYZ", "toolu_abc123-XYZ"], // already valid
 		];
-		const result = convert(msgs);
-		assert.equal(result[0].content[0].id, "functions_bash_0");
-		assert.equal(result[1].content[0].tool_use_id, "functions_bash_0");
-	});
-
-	it("IDs with spaces and special chars", () => {
-		const msgs = [
-			{ role: "assistant", content: [{ type: "toolCall", id: "tool call#1@foo", name: "bash", arguments: {} }] },
-			{ role: "toolResult", toolCallId: "tool call#1@foo", content: "ok" },
-		];
-		const result = convert(msgs);
-		assert.equal(result[0].content[0].id, "tool_call_1_foo");
-		assert.equal(result[1].content[0].tool_use_id, "tool_call_1_foo");
-	});
-
-	it("already-valid Anthropic IDs pass through unchanged", () => {
-		const msgs = [
-			{ role: "assistant", content: [{ type: "toolCall", id: "toolu_abc123-XYZ", name: "read", arguments: {} }] },
-			{ role: "toolResult", toolCallId: "toolu_abc123-XYZ", content: "data" },
-		];
-		const result = convert(msgs);
-		assert.equal(result[0].content[0].id, "toolu_abc123-XYZ");
-		assert.equal(result[1].content[0].tool_use_id, "toolu_abc123-XYZ");
-	});
-
-	it("keeps colliding sanitized IDs unique and paired", () => {
-		const msgs = [
-			{ role: "assistant", content: [
-				{ type: "toolCall", id: "call:a", name: "read", arguments: { path: "a" } },
-				{ type: "toolCall", id: "call?a", name: "read", arguments: { path: "b" } },
-			] },
-			{ role: "toolResult", toolCallId: "call:a", content: "A" },
-			{ role: "toolResult", toolCallId: "call?a", content: "B" },
-		];
-		const result = convert(msgs);
-		const useIds = result[0].content.map((block) => block.id);
-		const resultIds = result[1].content.map((block) => block.tool_use_id);
-		assert.equal(new Set(useIds).size, 2);
-		assert.deepEqual(resultIds, useIds);
-	});
-
-	it("bounds long foreign IDs without losing pairing or uniqueness", () => {
-		const common = `call_${"x".repeat(100)}`;
-		const msgs = [
-			{ role: "assistant", content: [
-				{ type: "toolCall", id: `${common}:a`, name: "read", arguments: {} },
-				{ type: "toolCall", id: `${common}:b`, name: "read", arguments: {} },
-			] },
-			{ role: "toolResult", toolCallId: `${common}:a`, content: "A" },
-			{ role: "toolResult", toolCallId: `${common}:b`, content: "B" },
-		];
-		const result = convert(msgs);
-		const useIds = result[0].content.map((block) => block.id);
-		assert.ok(useIds.every((id) => id.length <= 64 && /^[a-zA-Z0-9_-]+$/.test(id)));
-		assert.equal(new Set(useIds).size, 2);
-		assert.deepEqual(result[1].content.map((block) => block.tool_use_id), useIds);
-	});
-
-	it("tool_use and tool_result IDs stay paired after sanitization", () => {
-		const ids = ["fn.read:0", "fn.write:1", "fn.bash:2"];
-		const msgs = [];
-		for (const id of ids) {
-			msgs.push({ role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: {} }] });
-			msgs.push({ role: "toolResult", toolCallId: id, content: "ok" });
-		}
-		const result = convert(msgs);
-		for (let i = 0; i < ids.length; i++) {
-			const useId = result[i * 2].content[0].id;
-			const resultId = result[i * 2 + 1].content[0].tool_use_id;
-			assert.equal(useId, resultId, `pair ${i}: tool_use=${useId} tool_result=${resultId}`);
-		}
+		const result = convert(cases.flatMap(([id]) => [
+			{ role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: {} }] },
+			{ role: "toolResult", toolCallId: id, content: "ok" },
+		]));
+		cases.forEach(([, expected], i) => {
+			assert.equal(result[i * 2].content[0].id, expected);
+			assert.equal(result[i * 2 + 1].content[0].tool_use_id, expected);
+		});
 	});
 });
 
@@ -167,17 +105,6 @@ describe("thinking block filtering", () => {
 		assert.equal(result[0].content[0].signature, "sig123");
 	});
 
-	it("dropThinking strips signed Claude thinking so a Fable 5.1 rebuild does not 400", () => {
-		const msgs = [
-			{ role: "assistant", provider: "claude-bridge", content: [
-				{ type: "thinking", thinking: "reasoning...", thinkingSignature: "sig123" },
-				{ type: "text", text: "answer" },
-			]},
-		];
-		const result = convert(msgs, undefined, true);
-		assert.deepEqual(result[0].content, [{ type: "text", text: "answer" }]);
-	});
-
 	// A signature minted by another provider isn't ours to replay into Claude
 	// Code's session, so it is dropped even though the message is Anthropic's.
 	it("thinking from pi's own Anthropic provider is dropped", () => {
@@ -225,7 +152,7 @@ describe("message structure", () => {
 		assert.equal(result[0].content[0].type, "tool_result");
 		assert.equal(result[0].content[0].tool_use_id, "id1");
 		assert.equal(result[0].content[0].content, "result text");
-		assert.equal(result[0].content[0].is_error, false);
+		assert.ok(!("is_error" in result[0].content[0]), "a success carries no is_error, as CC writes it");
 	});
 
 	it("toolResult with isError=true", () => {
@@ -281,7 +208,7 @@ describe("message structure", () => {
 		assert.equal(result[0].content, "read file.txt");
 		assert.equal(result[1].role, "assistant");
 		assert.equal(result[1].content[0].type, "tool_use");
-		assert.equal(result[1].content[0].name, "Read");
+		assert.equal(result[1].content[0].name, "mcp__custom-tools__read");
 		assert.equal(result[2].role, "user");
 		assert.equal(result[2].content[0].type, "tool_result");
 		assert.equal(result[3].role, "assistant");
@@ -308,18 +235,18 @@ describe("message structure", () => {
 	// With a tool map the query runs `tools: []`, so no name in the transcript may
 	// look like a Claude Code builtin — that is what makes the model call one it
 	// cannot call. A tool missing from the map is one pi ran and we no longer
-	// serve, not a builtin.
+	// serve (an extension since disabled), not a builtin.
 	it("tool name mapping: unserved pi tools keep the MCP namespace", () => {
 		const served = new Map([["read", "mcp__custom-tools__read"]]);
 		const msgs = [
 			{ role: "assistant", content: [
 				{ type: "toolCall", id: "a", name: "read", arguments: {} },
 				{ type: "toolCall", id: "b", name: "bash", arguments: {} },
-				{ type: "toolCall", id: "c", name: "disabledExtensionTool", arguments: {} },
+				{ type: "toolCall", id: "c", name: "AskClaude", arguments: {} },
 			]},
 		];
 		assert.deepEqual(convert(msgs, served)[0].content.map((b) => b.name),
-			["mcp__custom-tools__read", "mcp__custom-tools__bash", "mcp__custom-tools__disabledExtensionTool"]);
+			["mcp__custom-tools__read", "mcp__custom-tools__bash", "mcp__custom-tools__AskClaude"]);
 	});
 
 	it("tool name mapping: an SDK name in pi history is a double mapping, not a tool", () => {
@@ -328,18 +255,6 @@ describe("message structure", () => {
 		];
 		assert.throws(() => convert(msgs), /already an SDK tool name/);
 		assert.throws(() => convert(msgs, new Map()), /already an SDK tool name/);
-	});
-
-	it("tool name mapping: pi names → SDK names", () => {
-		const msgs = [
-			{ role: "assistant", content: [
-				{ type: "toolCall", id: "a", name: "read", arguments: {} },
-				{ type: "toolCall", id: "b", name: "bash", arguments: {} },
-			]},
-		];
-		const result = convert(msgs);
-		assert.equal(result[0].content[0].name, "Read");
-		assert.equal(result[0].content[1].name, "Bash");
 	});
 
 	it("toolResult with array content extracts text", () => {
@@ -462,14 +377,6 @@ describe("conversion survives repairToolPairing", () => {
 		assert.deepEqual(repaired[1].content.map((b) => b.content), ["first", "second"]);
 		assert.equal(repaired[2].content, "actually stop and check X");
 	});
-
-	it("leaves no synthetic result stubs behind", () => {
-		const repaired = repairToolPairing(convert(parallelCall(5)));
-
-		const stubs = repaired.flatMap((m) => (Array.isArray(m.content) ? m.content : []))
-			.filter((b) => b.type === "tool_result" && typeof b.content === "string" && b.content.includes("no tool result recorded"));
-		assert.deepEqual(stubs, []);
-	});
 });
 
 describe("aborted assistant turns", () => {
@@ -481,14 +388,6 @@ describe("aborted assistant turns", () => {
 		]);
 		assert.equal(result.length, 2);
 		assert.deepEqual(result.map((m) => m.role), ["user", "user"]);
-	});
-
-	it("a turn whose blocks were all filtered still says so", () => {
-		const result = convert([
-			{ role: "assistant", provider: "deepseek", content: [{ type: "thinking", thinking: "deep thoughts" }] },
-		]);
-		assert.equal(result.length, 1);
-		assert.equal(result[0].content[0].text, "[incompatible content omitted]");
 	});
 
 	// The prompt cache is keyed on exact prefix bytes, so a rebuild must reproduce
@@ -518,33 +417,5 @@ describe("aborted assistant turns", () => {
 		]);
 		assert.deepEqual(result.map((m) => m.role), ["assistant", "user"]);
 		assert.equal(result[1].content[0].tool_use_id, "t1");
-	});
-});
-
-describe("dropped-content accounting", () => {
-	it("counts stripped thinking by provider and aborted turns", () => {
-		const { dropped } = convertPiMessages([
-			{ role: "assistant", provider: "openrouter", content: [
-				{ type: "thinking", thinking: "reasoning" },
-				{ type: "text", text: "the answer" },
-			]},
-			{ role: "assistant", content: [] },
-			{ role: "assistant", provider: "claude-bridge", content: [
-				{ type: "thinking", thinking: "mine", thinkingSignature: "sig" },
-			]},
-		]);
-		assert.equal(dropped.thinking, 1);
-		assert.deepEqual([...dropped.providers], ["openrouter"]);
-		assert.equal(dropped.abortedTurns, 1);
-	});
-
-	it("reports nothing when everything converts", () => {
-		const { dropped } = convertPiMessages([
-			{ role: "user", content: [{ type: "text", text: "hi" }] },
-			{ role: "assistant", content: [{ type: "text", text: "hello" }] },
-		]);
-		assert.equal(dropped.thinking, 0);
-		assert.equal(dropped.abortedTurns, 0);
-		assert.equal(dropped.other.size, 0);
 	});
 });

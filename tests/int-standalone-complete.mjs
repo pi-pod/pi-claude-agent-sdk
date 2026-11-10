@@ -48,13 +48,13 @@ try {
 	if (!/after-ok/i.test(after)) throw new Error(`post-standalone turn failed: ${after}`);
 
 	const log = readFileSync(DEBUG_LOG, "utf8");
-	if (!/routing standalone cacheRetention=none request to isolated subprocess/.test(log)) {
+	if (!/provider: one-off summarizer call \(cacheRetention none\) routed to isolated summary/.test(log)) {
 		throw new Error("debug log has no standalone routing marker");
 	}
 	if (/prompt-capture: no match/.test(log)) {
 		throw new Error("standalone prompt reached prompt capture");
 	}
-	const established = log.match(/provider: query done, session=([0-9a-f]+)/)?.[1];
+	const established = log.match(/syncResult: path=clean-start sessionId=([0-9a-f-]+)/)?.[1];
 	const resumed = log.match(/syncResult: path=reuse sessionId=([0-9a-f-]+)/)?.[1];
 	if (!established || !resumed) {
 		throw new Error(`expected an established and resumed chat session, got established=${established} resumed=${resumed}`);
@@ -62,7 +62,7 @@ try {
 	if (!resumed.startsWith(established)) {
 		throw new Error(`standalone call changed chat session: ${established} -> ${resumed}`);
 	}
-	const standaloneEnd = log.indexOf("standalone: done");
+	const standaloneEnd = log.indexOf("compact summary: done");
 	if (/syncResult: path=rebuild/.test(log.slice(standaloneEnd))) {
 		throw new Error("post-standalone chat turn rebuilt instead of resuming");
 	}

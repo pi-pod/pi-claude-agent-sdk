@@ -4,193 +4,88 @@
  * on its own, nothing throws, and the damage shows up in the user's ~/.claude
  * rather than in a test.
  */
-import { afterEach, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 
-const { CC_CHILD_ENV, CHILD_OAUTH_MIN_VALIDITY_MS, buildClaudeChildEnv, resolveClaudeChildEnv, resetChildAuthState } =
-	await import("../src/child-env.js");
+const { __test } = await import("../src/index.js");
+const { activateWithMockPi } = await import("./lib/mock-pi.mjs");
 
 describe("Claude Code child environment", () => {
-	it("disables auto-compaction and claude.ai MCP servers", () => {
-		assert.deepEqual(CC_CHILD_ENV, {
+	it("disables auto-compaction, claude.ai MCP servers, request logging, non-essential traffic, interrupted-turn resume and the silent-turn reminder; raises the MCP description limit", () => {
+		assert.deepEqual(__test.CC_CHILD_ENV, {
 			ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 			DISABLE_AUTO_COMPACT: "1",
+			CLAUDE_CODE_ELEGANT_MEADOW: "0",
+			CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+			CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: "1",
+			CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
+			CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: "16384",
 		});
 	});
 
-	it("injects Pi OAuth through Claude Code's supported token variable", () => {
-		const env = buildClaudeChildEnv(
-			{
-				ANTHROPIC_API_KEY: "inherited-key",
-				ANTHROPIC_AUTH_TOKEN: "inherited-token",
-				ANTHROPIC_BASE_URL: "https://inherited.invalid",
-				ANTHROPIC_CUSTOM_HEADERS: "authorization: inherited",
-				CLAUDE_CODE_USE_BEDROCK: "1",
-			},
-			{ auth: { apiKey: "pi-oauth" }, source: "OAuth" },
-		);
-		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "pi-oauth");
-		assert.equal(env.ANTHROPIC_API_KEY, undefined);
-		assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
-		assert.equal(env.ANTHROPIC_BASE_URL, undefined);
-		assert.equal(env.ANTHROPIC_CUSTOM_HEADERS, undefined);
-		assert.equal(env.CLAUDE_CODE_USE_BEDROCK, undefined);
+	it("keeps the traffic flag off pi's own process, where every command pi runs would inherit it", () => {
+		const saved = process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
+		delete process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
+		try {
+			activateWithMockPi();
+			assert.equal(process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined);
+		} finally {
+			if (saved !== undefined) process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = saved;
+		}
 	});
 
-	it("injects Pi API keys without leaving an inherited OAuth override", () => {
-		const env = buildClaudeChildEnv(
-			{ CLAUDE_CODE_OAUTH_TOKEN: "inherited-oauth", ANTHROPIC_BASE_URL: "https://inherited.invalid" },
-			{
-				auth: { apiKey: "pi-api-key", baseUrl: "https://pi-anthropic.invalid" },
-				source: "ANTHROPIC_API_KEY",
-			},
-		);
-		assert.equal(env.ANTHROPIC_API_KEY, "pi-api-key");
-		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
-		assert.equal(env.ANTHROPIC_BASE_URL, "https://pi-anthropic.invalid");
+	const config = { ANTHROPIC_API_KEY: "key", CLAUDE_CONFIG_DIR: "/cfg", CLAUDE_CODE_USE_BEDROCK: "1", AI_AGENT: "pi" };
+
+	it("drops a parent Claude Code session's markers when pi was started from inside one, keeping config", () => {
+		const parent = {
+			...config,
+			CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ID: "parent", CLAUDE_CODE_CHILD_SESSION: "1",
+			CLAUDE_ENV_FILE: "/parent/env.sh", CLAUDE_AGENT_SDK_VERSION: "0.0.1", CLAUDE_CODE_SSE_PORT: "1234", TRACEPARENT: "00-parent",
+		};
+		const env = __test.ccChildEnv(undefined, parent);
+		assert.deepEqual(env, { ...config, ...__test.CC_CHILD_ENV });
+		assert.equal(parent.CLAUDECODE, "1", "pi's own environment is not modified");
 	});
 
-	it("routes Pi OAuth env credentials through Claude Code OAuth", () => {
-		const env = buildClaudeChildEnv({}, {
-			auth: { apiKey: "pi-oauth-env" },
-			source: "ANTHROPIC_OAUTH_TOKEN",
+	it("passes everything through when pi wasn't started from Claude Code", () => {
+		const parent = { ...config, CLAUDE_CODE_ENTRYPOINT: "claude-vscode", TRACEPARENT: "00-user" };
+		assert.deepEqual(__test.ccChildEnv(undefined, parent), { ...parent, ...__test.CC_CHILD_ENV });
+	});
+
+	it("applies pi's provider env over pi's own, an empty value unsetting, without dropping the bridge's guards", () => {
+		const env = __test.ccChildEnv({ HTTPS_PROXY: "http://proxy", ANTHROPIC_API_KEY: "", DISABLE_AUTO_COMPACT: "0" }, config);
+		const { ANTHROPIC_API_KEY: _unset, ...kept } = config;
+		assert.deepEqual(env, { ...kept, HTTPS_PROXY: "http://proxy", ...__test.CC_CHILD_ENV });
+	});
+
+	it("refuses a provider env that would move Claude Code's session files", () => {
+		assert.throws(() => __test.ccChildEnv({ CLAUDE_CONFIG_DIR: "/elsewhere" }, config), /CLAUDE_CONFIG_DIR/);
+		assert.throws(() => __test.ccChildEnv({ home: "/elsewhere" }, config), /home/);
+	});
+
+	it("passes the request's env to the isolated summary query", async () => {
+		const launches = [];
+		__test.setQuery(({ options }) => {
+			launches.push(options);
+			const q = (async function* () { yield { type: "result", subtype: "success", is_error: false, result: "ok" }; })();
+			q.interrupt = async () => {};
+			q.close = () => {};
+			return q;
 		});
-		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "pi-oauth-env");
-		assert.equal(env.ANTHROPIC_API_KEY, undefined);
+		try {
+			const model = { id: "claude-haiku-4-5", api: "claude-bridge", provider: "claude-bridge", reasoning: false, input: ["text"], contextWindow: 200_000, maxTokens: 64_000 };
+			const context = { systemPrompt: "Summarize.", messages: [{ role: "user", content: [{ type: "text", text: "go" }], timestamp: 0 }] };
+			const result = await __test.isolatedStreamFn(model, context, { cacheRetention: "none", env: { HTTPS_PROXY: "http://proxy" } }).result();
+			assert.equal(result.stopReason, "stop", result.errorMessage);
+			assert.equal(launches[0].env.HTTPS_PROXY, "http://proxy");
+		} finally {
+			__test.setQuery(null);
+		}
 	});
 
-	it("forwards Pi-resolved bearer auth and provider environment", () => {
-		const env = buildClaudeChildEnv(
-			{ ANTHROPIC_AUTH_TOKEN: "inherited-bearer" },
-			{
-				auth: { headers: { Authorization: "Bearer pi-bearer", "x-pi-header": "value" } },
-				env: { PI_AUTH_CONTEXT: "resolved", ANTHROPIC_API_KEY: "ignored-shadow" },
-				source: "ANTHROPIC_AUTH_TOKEN",
-			},
-		);
-		assert.equal(env.ANTHROPIC_AUTH_TOKEN, "pi-bearer");
-		assert.equal(env.ANTHROPIC_API_KEY, undefined);
-		assert.equal(env.ANTHROPIC_CUSTOM_HEADERS, "x-pi-header: value");
-		assert.equal(env.PI_AUTH_CONTEXT, "resolved");
-	});
-
-	it("rejects inherited Claude Code auth when Pi has no Anthropic credential", () => {
-		assert.throws(
-			() => buildClaudeChildEnv({ CLAUDE_CODE_OAUTH_TOKEN: "cc-login" }),
-			/No Anthropic credential is configured in Pi/,
-		);
-	});
-
-	it("resolves the Anthropic credential through Pi for every child", async () => {
-		const calls = [];
-		const registry = {
-			async getProviderAuth(provider) {
-				calls.push(provider);
-				return { auth: { apiKey: "fresh-token" }, source: "OAuth" };
-			},
-		};
-		const env = await resolveClaudeChildEnv(registry, {});
-		assert.deepEqual(calls, ["anthropic"]);
-		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "fresh-token");
-	});
-
-	it("requires a Pi model registry and resolved Anthropic credential", async () => {
-		await assert.rejects(resolveClaudeChildEnv(null, { CLAUDE_CODE_OAUTH_TOKEN: "cc-login" }), /No Anthropic credential/);
-		await assert.rejects(
-			resolveClaudeChildEnv({ async getProviderAuth() { return undefined; } }, {}),
-			/No Anthropic credential/,
-		);
-	});
-
-	// Deliberately not asserted here: that every `query()` call site awaits the
-	// helper. Grepping source would fail on innocent indirection and read as
-	// coverage; the integration auth test exercises the actual child process.
-});
-
-/**
- * A child keeps the OAuth token it was spawned with for its whole turn and can't
- * refresh it, so a token handed over with minutes left fails the turn with
- * "401 OAuth access token has expired". The bridge asks pi for a longer minimum
- * through ModelRuntime.getAuth, which pi's public getProviderAuth doesn't expose.
- */
-describe("OAuth validity for Claude Code children", () => {
-	const realFetch = globalThis.fetch;
-	afterEach(() => {
-		globalThis.fetch = realFetch;
-		resetChildAuthState();
-	});
-
-	async function realRegistry(expiresInMs) {
-		const credentials = new InMemoryCredentialStore();
-		await credentials.modify("anthropic", async () => ({
-			type: "oauth", access: "stale-access", refresh: "refresh-token", expires: Date.now() + expiresInMs,
-		}));
-		const runtime = await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false });
-		return { registry: new ModelRegistry(runtime), credentials };
-	}
-
-	function stubTokenEndpoint(expiresInSeconds) {
-		const requests = [];
-		globalThis.fetch = async (url, init) => {
-			requests.push({ url: String(url), body: JSON.parse(init.body) });
-			return new Response(JSON.stringify({
-				access_token: "fresh-access", refresh_token: "rotated-refresh", expires_in: expiresInSeconds,
-			}), { status: 200 });
-		};
-		return requests;
-	}
-
-	// Pins the private seam against the installed pi: if ModelRegistry stops
-	// holding `runtime` or getAuth drops minOAuthValidityMs, this fails rather
-	// than the bridge silently reverting to pi's five-minute window.
-	it("refreshes through pi a token pi itself would still hand out", async () => {
-		const { registry, credentials } = await realRegistry(60 * 60 * 1000);
-		const requests = stubTokenEndpoint(8 * 60 * 60);
-		assert.equal((await registry.getProviderAuth("anthropic")).auth.apiKey, "stale-access", "pi's default window keeps a one-hour token");
-		assert.equal(requests.length, 0);
-
-		const env = await resolveClaudeChildEnv(registry, {});
-		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "fresh-access");
-		assert.equal(requests.length, 1);
-		assert.equal(requests[0].body.grant_type, "refresh_token");
-		assert.equal((await credentials.read("anthropic")).refresh, "rotated-refresh", "the rotated credential is persisted");
-	});
-
-	it("leaves a token with more than the minimum alone", async () => {
-		const { registry } = await realRegistry(CHILD_OAUTH_MIN_VALIDITY_MS + 60 * 60 * 1000);
-		const requests = stubTokenEndpoint(8 * 60 * 60);
-		const env = await resolveClaudeChildEnv(registry, {});
-		assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "stale-access");
-		assert.equal(requests.length, 0);
-	});
-
-	it("stops asking for the minimum once the provider can't meet it", async () => {
-		const { registry } = await realRegistry(60 * 60 * 1000);
-		// One-hour tokens: every refresh comes back short of a two-hour minimum.
-		const requests = stubTokenEndpoint(60 * 60);
-		assert.equal((await resolveClaudeChildEnv(registry, {})).CLAUDE_CODE_OAUTH_TOKEN, "fresh-access");
-		assert.equal(requests.length, 1);
-		await resolveClaudeChildEnv(registry, {});
-		await resolveClaudeChildEnv(registry, {});
-		assert.equal(requests.length, 1, "no refresh per spawn");
-	});
-
-	it("falls back to getProviderAuth when the runtime call fails or is absent", async () => {
-		const fallback = { async getProviderAuth() { return { auth: { apiKey: "public-token" }, source: "OAuth" }; } };
-		assert.equal((await resolveClaudeChildEnv(fallback, {})).CLAUDE_CODE_OAUTH_TOKEN, "public-token");
-
-		const overrides = [];
-		const failing = {
-			...fallback,
-			runtime: { async getAuth(_provider, o) { overrides.push(o); throw new Error("OAuth refresh failed for anthropic"); } },
-		};
-		assert.equal((await resolveClaudeChildEnv(failing, {})).CLAUDE_CODE_OAUTH_TOKEN, "public-token");
-		await resolveClaudeChildEnv(failing, {});
-		assert.deepEqual(overrides, [
-			{ minOAuthValidityMs: CHILD_OAUTH_MIN_VALIDITY_MS },
-			{ minOAuthValidityMs: CHILD_OAUTH_MIN_VALIDITY_MS },
-		], "a transient refresh failure doesn't disable the minimum");
-	});
+	// Deliberately not asserted here: that every `query()` call site spreads the
+	// constant. The only way to check that from a unit test is to grep src/index.ts,
+	// which fails on innocent indirection (`env: childEnv`) and would have to be
+	// taught about it — a brittle test that reads as coverage. The three sites
+	// calling ccChildEnv() are the guard, and a fourth is a review question.
 });

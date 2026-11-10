@@ -1,11 +1,7 @@
 import type { AuthResult } from "@earendil-works/pi-ai";
 
-// Applied to every Claude Code subprocess the bridge spawns. Pi owns both its
-// tool surface and context compaction, so Claude Code must not add either one.
-export const CC_CHILD_ENV = {
-	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
-	DISABLE_AUTO_COMPACT: "1",
-} as const;
+import { ccChildEnv } from "./cc-child.js";
+export { CC_CHILD_ENV } from "./cc-child.js";
 
 export interface AnthropicAuthRegistry {
 	getProviderAuth(provider: string): Promise<AuthResult | undefined>;
@@ -22,8 +18,9 @@ export interface AnthropicAuthRegistry {
 export function buildClaudeChildEnv(
 	base: NodeJS.ProcessEnv,
 	resolved?: AuthResult,
+	overrides: Record<string, string> = {},
 ): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...base, ...(resolved?.env ?? {}), ...CC_CHILD_ENV };
+	const env = ccChildEnv({ ...resolved?.env, ...overrides }, base);
 	for (const key of [
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
@@ -102,9 +99,10 @@ async function resolveAnthropicAuth(registry: AnthropicAuthRegistry): Promise<Au
 export async function resolveClaudeChildEnv(
 	registry: AnthropicAuthRegistry | null | undefined,
 	base: NodeJS.ProcessEnv = process.env,
+	overrides: Record<string, string> = {},
 ): Promise<NodeJS.ProcessEnv> {
 	const resolved = registry ? await resolveAnthropicAuth(registry) : undefined;
-	return buildClaudeChildEnv(base, resolved);
+	return buildClaudeChildEnv(base, resolved, overrides);
 }
 
 /** Test hook: clear the unsatisfiable-minimum latch. */

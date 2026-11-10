@@ -45,9 +45,8 @@ describe("Claude bridge → foreign provider history", () => {
 
 		const transformed = transformMessages(history, target, (id) => id);
 		const assistant = transformed.find((message) => message.role === "assistant");
-		assert.equal(assistant.content[0].type, "text");
-		assert.equal(assistant.content[0].text, "Claude reasoning");
-		assert.equal("thinkingSignature" in assistant.content[0], false);
+		assert.equal(assistant.content.some((block) => block.type === "thinking"), false);
+		assert.equal(assistant.content.some((block) => "thinkingSignature" in block), false);
 		const callIds = assistant.content.filter((block) => block.type === "toolCall").map((block) => block.id);
 		const resultIds = transformed.filter((message) => message.role === "toolResult").map((message) => message.toolCallId);
 		assert.deepEqual(callIds, ids);

@@ -1,5 +1,12 @@
 # Changelog
 
+## UNRELEASED
+
+- **Bump: sync upstream through v0.12.0** — require pi ≥1.5.1, pin Agent SDK 0.3.321 (Claude Code 2.1.321), and update cc-session-io to ^0.4.1. Adds Fable 5.2 and Haiku 5.5 at 1M; adopts upstream's thinking-off support, plan-usage headers, Extra Usage warnings, and cache diagnostics. Removes the obsolete system-prompt guard for pi 1.5.
+- **Fix: retain matching Claude Code history across edits and restarts** — content-digest synchronization preserves safe native prefixes, prompt cache and thinking across forks, rewinds, interruptions and foreign-provider turns. Session pointers persist under pi's agent directory; changed instructions force a fresh import. Tool results remain scoped to their owning session, empty error results receive valid placeholders, and normalized tool arguments no longer cause spurious rebuilds.
+- **Fix: keep repo-controlled Claude settings out of provider turns** — ignore project-level provider configuration and Claude Code project/local settings; pin the default output style, suppress silent-turn reminders, and apply bash's default timeout only at execution without changing saved arguments.
+- **Tests: retain provider-only fork contracts across the upstream rewrite** — preserve Pi-only Anthropic authentication and early OAuth refresh, standalone no-cache completions with private prompts and usage, Max defaults, Fable CLI compatibility, and bounded collision-safe foreign tool IDs. AskClaude remains excluded; offline regressions and live authentication, compaction and cross-provider tests cover the integration.
+
 ## 0.9.2 — 2026-10-01
 
 - **Fix: long turns failing with "401 OAuth access token has expired"** — Claude Code keeps the OAuth token it was spawned with for the whole turn and can't refresh it, while Pi only refreshes a token with under five minutes left, so a turn that outlived its token failed until the next prompt. The bridge now asks Pi for at least two hours of validity before spawning, through `ModelRuntime.getAuth`'s `minOAuthValidityMs` (Pi's public `getProviderAuth` takes no overrides), falling back to `getProviderAuth` if that fails. Covered by `tests/unit-child-env.mjs` against Pi's real registry.

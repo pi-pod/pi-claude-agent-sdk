@@ -1,16 +1,19 @@
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import { formatProjectContext } from "./agents-md.js";
-import { DEBUG_LOG_PATH } from "./log-paths.js";
-import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
+import { renderSkillsBlock } from "./skills.js";
 
 // What pi assembled for one agent, kept so the bridge can append only the
 // portable parts after Claude Code's own preset.
 
-export type PromptCaptureInput = {
+type PromptCaptureInput = {
 	custom?: string;
 	append?: string;
 	contextFiles: { path: string; content: string }[];
 	skills: Skill[];
+	/** Custom prompt sections from `systemPromptOptions.sections`, raw content keyed by
+	 *  section name. pi renders each one as `<name>\ncontent\n</name>` after the built-in
+	 *  sections; the projection does the same. */
+	sections?: Record<string, string>;
 };
 
 type InheritedPrompt = {
@@ -36,7 +39,7 @@ export type PromptCapture = PromptCaptureInput & {
  * without recognizing pi prose or sub-agent markers. If pi later exposes an
  * inherited-system-prompt field, it should replace this inference.
  */
-export type PromptCaptureDiagnostic = {
+type PromptCaptureDiagnostic = {
 	/** The prompt that matched nothing: the full system prompt is too big to log
 	 *  inline, so a fingerprint plus the closest match's first divergent offset
 	 *  are enough to recognize the pump.
@@ -87,6 +90,9 @@ export class PromptCaptures {
 		capture.append = input.append;
 		capture.contextFiles = input.contextFiles.map((file) => ({ ...file }));
 		capture.skills = [...input.skills];
+		// Copied, not referenced: the caller's systemPromptOptions is a live object that
+		// later before_agent_start handlers mutate.
+		capture.sections = { ...input.sections };
 		capture.source = source;
 		if (!existing || customChanged) {
 			capture.inherited = this.findInheritedPrompts(systemPrompt, input.custom);
@@ -189,9 +195,11 @@ export class PromptCaptures {
 				+ `Closest known match diverges at offset ${matches[0]?.firstDivergent ?? "?"} `
 				+ `(${matches.length ? matches[0].key.length : 0}-char key${matches[0]?.source ? `, last recorded at ${matches[0].source}` : ""}). `
 				+ `Claude Code would receive none of this turn's context files, skills or custom instructions. `
-				+ `The usual cause is an extension loaded after claude-bridge that rewrites the system prompt from before_agent_start — `
-				+ `one that wraps it is fine, one that rebuilds or strips it leaves nothing to match. `
-				+ `(Also possible: pi rebuilt the prompt outside before_agent_start — a late-registered tool or fresh resource discovery.)`,
+				+ `When the divergence sits at a section's opening tag, the capture and this prompt disagree about that section — `
+				+ `pi's mcp_servers since pi 0.99.2, or one an extension added. `
+				+ `Otherwise an extension loaded after claude-bridge rewrote the system prompt from before_agent_start — `
+				+ `one that wraps it is fine, one that rebuilds or strips it leaves nothing to match — `
+				+ `or pi rebuilt the prompt outside before_agent_start (a late-registered tool or fresh resource discovery).`,
 			);
 		}
 
@@ -261,19 +269,6 @@ export class PromptCaptures {
 	}
 }
 
-/** Pi's own preamble, the first section of every prompt pi renders for a session
- *  without a custom prompt. Machine-generated, so operator text never carries it;
- *  forwarding it makes Claude Code's subscription path read the request as a
- *  third-party app. */
-export const PI_PREAMBLE = "You are an expert coding assistant operating inside pi";
-
-/** Both doc paths from pi's documentation-routing line. Anthropic's subscription gate
- *  rejects a system prompt carrying both, while either alone passes (issues #883, #88). */
-const ANTHROPIC_THIRD_PARTY_TRIGGERS = ["docs/custom-provider.md", "docs/packages.md"];
-
-/** One piece of the append, named so a refusal can say where it found the text. */
-type PromptPart = { label: string; text: string };
-
 const SHARED_CAPTURES_KEY = Symbol.for("claude-bridge:promptCaptures");
 
 /** Isolated agents re-evaluate this module; a process-wide instance lets the pinned
@@ -287,15 +282,14 @@ export function sharedPromptCaptures(onDiagnose?: (diagnostic: PromptCaptureDiag
 
 export function projectPromptCapture(
 	capture: PromptCapture,
-	options: { skillReadTool: SkillReadTool },
+	options: { hasReadTool: boolean },
 ): string | undefined {
 	return projectCapture(capture, options, new Set());
 }
 
-/** Skills visible through inherited prompts, ancestor first and once per file. */
-export function collectPromptSkills(capture: PromptCapture): Skill[] {
-	const result: Skill[] = [];
-	const seenPaths = new Set<string>();
+/** File paths of the skills `capture`'s inherited prompts already list. */
+function inheritedSkillPaths(capture: PromptCapture): Set<string> {
+	const paths = new Set<string>();
 	const visited = new Set<PromptCapture>();
 	const visiting = new Set<PromptCapture>();
 
@@ -304,92 +298,53 @@ export function collectPromptSkills(capture: PromptCapture): Skill[] {
 		if (visiting.has(node)) throw new Error("Cyclic prompt inheritance");
 		visiting.add(node);
 		for (const edge of node.inherited) visit(edge.parent);
-		for (const skill of node.skills) {
-			if (skill.disableModelInvocation || seenPaths.has(skill.filePath)) continue;
-			seenPaths.add(skill.filePath);
-			result.push(skill);
-		}
+		for (const skill of node.skills) if (!skill.disableModelInvocation) paths.add(skill.filePath);
 		visiting.delete(node);
 		visited.add(node);
 	};
 
-	visit(capture);
-	return result;
+	for (const edge of capture.inherited) visit(edge.parent);
+	return paths;
 }
 
 function projectCapture(
 	capture: PromptCapture,
-	options: { skillReadTool: SkillReadTool },
+	options: { hasReadTool: boolean },
 	visiting: Set<PromptCapture>,
 ): string | undefined {
 	if (visiting.has(capture)) throw new Error("Cyclic prompt inheritance");
 	visiting.add(capture);
 	try {
-		const inheritedSkillPaths = new Set(
-			capture.inherited.flatMap((edge) => collectPromptSkills(edge.parent).map((skill) => skill.filePath)),
-		);
-		const ownSkillPaths = new Set<string>();
+		const seenSkillPaths = inheritedSkillPaths(capture);
 		const ownSkills = capture.skills.filter((skill) => {
-			if (skill.disableModelInvocation || inheritedSkillPaths.has(skill.filePath) || ownSkillPaths.has(skill.filePath)) {
-				return false;
-			}
-			ownSkillPaths.add(skill.filePath);
+			if (skill.disableModelInvocation || seenSkillPaths.has(skill.filePath)) return false;
+			seenSkillPaths.add(skill.filePath);
 			return true;
 		});
 
 		const custom = projectCustom(capture, options, visiting);
-		const parts: PromptPart[] = [];
+		const parts: string[] = [];
 		const context = formatProjectContext(capture.contextFiles);
-		if (context) parts.push({ label: "the project context block", text: context });
-		const skills = renderSkillsBlock(ownSkills, options.skillReadTool);
-		if (skills) parts.push({ label: "the skills block", text: skills });
-		if (custom) parts.push({ label: "the custom prompt", text: custom });
-		if (capture.append) parts.push({ label: "the appended instructions", text: capture.append });
-		assertSendablePrompt(parts, capture);
-		return parts.length > 0 ? parts.map((part) => part.text).join("\n\n") : undefined;
+		if (context) parts.push(context);
+		const skills = renderSkillsBlock(ownSkills, options.hasReadTool);
+		if (skills) parts.push(skills);
+		if (custom) parts.push(custom);
+		if (capture.append) parts.push(capture.append);
+		// pi's builder renders custom sections last, after `cwd` — the one built-in section
+		// with nothing portable to forward — so they follow the append here.
+		for (const [name, content] of Object.entries(capture.sections ?? {})) {
+			if (!content) continue;
+			parts.push(`<${name}>\n${content}\n</${name}>`);
+		}
+		return parts.length > 0 ? parts.join("\n\n") : undefined;
 	} finally {
 		visiting.delete(capture);
 	}
 }
 
-function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCapture): void {
-	const findings: string[] = [];
-	for (const { label, text } of parts) {
-		const offset = preambleAtLineStart(text);
-		if (offset !== -1) {
-			findings.push(`pi's preamble ("${PI_PREAMBLE}") in ${label}, at offset ${offset} of ${text.length} chars`);
-		}
-		// The pair has to co-occur in one part; the two phrases split across parts are not detected.
-		if (ANTHROPIC_THIRD_PARTY_TRIGGERS.every((trigger) => text.includes(trigger))) {
-			findings.push(`${ANTHROPIC_THIRD_PARTY_TRIGGERS.join(" and ")} in ${label}`);
-		}
-	}
-	if (findings.length === 0) return;
-
-	throw new Error([
-		"prompt-capture: refusing to send this prompt. Claude Code's Anthropic path reads a request",
-		"  carrying pi's harness, or the phrase pair its subscription gate rejects, as a third-party",
-		"  app: it fails with 400 or is billed as extra usage.",
-		...findings.map((finding) => `  Found: ${finding}.`),
-		`  Capture: ${capture.source ?? "unknown"}, ${capture.inherited.length} inherited capture(s) substituted.`,
-		"  If this came from an inherited pi prompt, see README \"Compatibility with other extensions\".",
-		"  If it is your own text, reword or remove it. CLAUDE_BRIDGE_DEBUG=1 writes the full prompt to",
-		`  ${DEBUG_LOG_PATH}.`,
-	].join("\n"));
-}
-
-/** Offset of pi's preamble at the start of a line, or -1. Mid-line mentions are someone
- *  describing pi's prompt, not pi's prompt. */
-function preambleAtLineStart(text: string): number {
-	for (let offset = text.indexOf(PI_PREAMBLE); offset !== -1; offset = text.indexOf(PI_PREAMBLE, offset + PI_PREAMBLE.length)) {
-		if (offset === 0 || text[offset - 1] === "\n") return offset;
-	}
-	return -1;
-}
-
 function projectCustom(
 	capture: PromptCapture,
-	options: { skillReadTool: SkillReadTool },
+	options: { hasReadTool: boolean },
 	visiting: Set<PromptCapture>,
 ): string | undefined {
 	if (!capture.custom || capture.inherited.length === 0) return capture.custom;
